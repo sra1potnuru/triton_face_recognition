@@ -524,7 +524,7 @@ class Face(dict):
 from collections import defaultdict, Counter
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
-
+import psycopg2
 
 # Import your existing YOLO, RetinaFace, ArcFace classes and Face dataclass
 # from some_module import YoloPersonDetector, RetinaFace, ArcFaceONNX, Face
@@ -823,51 +823,86 @@ class FaceReIDPipeline:
         print(f"💾 Saved {len(representative_faces)} representative faces.")
         return representative_faces, finalized_id_map
 
-    # -------------- Synchronous per-crop processor (from code2) --------------
-    def _process_crop_sync(self, tid, crop):
+    # -------------- Async helpers borrowed from code2 (but extended) --------------
+    async def _process_single_face(self, crop, face_obj):
+        """Process a single face: embedding + FAISS search.
+        Returns: (score(float), name(str), embedding_flat(np.ndarray), det_score(float))
+        """
         try:
-            t0_buffalo = time.perf_counter()
-            bboxes, kpss = self.face_detector.detect(crop, input_size=(640, 640))
-            self.timing["buffalo_detection"] += time.perf_counter() - t0_buffalo
+            emb = await self.face_embedder.get_async(crop, face_obj)
+            emb = emb.astype("float32").reshape(1, -1)
+            faiss.normalize_L2(emb)
+
+            # FAISS search in thread pool (CPU-bound operation)
+            def _faiss_search():
+                return self.index.search(emb, 1)
+
+            scores, indices = await asyncio.to_thread(_faiss_search)
+            score, idx = float(scores[0][0]), int(indices[0][0])
+
+            name = self.names[idx] if score >= self.sim_threshold else "Unknown"
+            return score, name, emb.flatten().copy(), float(face_obj.det_score if hasattr(face_obj, 'det_score') else 0.0)
+
+        except Exception as e:
+            print(f"[Error in _process_single_face] {e}")
+            return -1.0, "Unknown", None, 0.0
+
+    async def _process_single_crop_async(self, tid, crop):
+        """Process a single crop: face detection + per-face async embedding + FAISS search.
+        Returns: tid, result_obj ({"status": ...}), crop_b64 or None, best_embedding (1D np array or None), best_conf(float)
+        """
+        try:
+            bboxes, kpss = await self.face_detector.detect_async(crop, input_size=(640, 640))
 
             if bboxes.shape[0] == 0:
                 return tid, {"status": "No face"}, None, None, 0.0
 
             best_score = -1.0
             best_name = "Unknown"
+            crop_b64 = None
             best_emb = None
             best_conf = 0.0
 
+            # Process all faces in parallel
+            face_tasks = []
+            face_objs = []
             for i in range(bboxes.shape[0]):
                 bbox = bboxes[i, :4]
                 det_score = float(bboxes[i, 4])
                 if det_score < 0.5:
                     continue
+
                 kps = kpss[i] if kpss is not None else None
                 face_obj = Face(bbox=bbox, kps=kps, det_score=det_score)
-                emb = self.face_embedder.get(crop, face_obj)
-                emb = emb.astype("float32").reshape(1, -1)
-                faiss.normalize_L2(emb)
+                face_objs.append(face_obj)
+                face_tasks.append(self._process_single_face(crop, face_obj))
 
-                t0_faiss = time.perf_counter()
-                scores, indices = self.index.search(emb, 1)
-                self.timing["faiss_search"] += time.perf_counter() - t0_faiss
+            if not face_tasks:
+                return tid, {"status": "No face"}, None, None, 0.0
 
-                score, idx = float(scores[0][0]), int(indices[0][0])
+            face_results = await asyncio.gather(*face_tasks)
 
+            for (score, name, emb_flat, det_score) in face_results:
                 if score > best_score:
                     best_score = score
-                    best_name = self.names[idx] if score >= self.sim_threshold else "Unknown"
-                    best_emb = emb.flatten().copy()
+                    best_name = name
+                    best_emb = emb_flat.copy() if emb_flat is not None else None
                     best_conf = det_score
 
-            return tid, {"status": best_name}, None, best_emb, best_conf
+            if crop.size > 0:
+                try:
+                    _, buffer = cv2.imencode(".jpg", crop)
+                    crop_b64 = base64.b64encode(buffer).decode("utf-8")
+                except Exception:
+                    crop_b64 = None
+
+            return tid, {"status": best_name}, crop_b64, best_emb, best_conf
 
         except Exception as e:
-            print(f"[Error in _process_crop_sync] {e}")
+            print(f"[Error in _process_single_crop_async] {e}")
             return tid, {"status": "Error"}, None, None, 0.0
 
-    # --------------------- Main async pipeline (based on code1) ---------------------
+    # --------------------- Main async pipeline (merged) ---------------------
     async def process_frames(self, frames: list[np.ndarray]):
         """Main async frame processing with TRUE parallel Triton calls and clustering integration."""
         start_time = time.perf_counter()
@@ -937,106 +972,50 @@ class FaceReIDPipeline:
                 "timing": timing_detailed
             }         
 
-        # STEP 4: PARALLEL BUFFALO FACE DETECTION
+        # STEP 4: PARALLEL BUFFALO FACE DETECTION + RECOGNITION per crop (from code2 async style)
         t0_detection = time.perf_counter()
-        detection_tasks = [self.face_detector.detect_async(crop, input_size=(640, 640)) for tid, crop, frame_idx in all_crops_data]
+        detection_tasks = [self._process_single_crop_async(tid, crop) for tid, crop, frame_idx in all_crops_data]
         detection_results = await asyncio.gather(*detection_tasks)
         timing_detailed["buffalo_detection"] = time.perf_counter() - t0_detection
 
-        # STEP 5: PREPARE FACE OBJECTS
-        all_face_data = []  # (tid, crop, face_obj, crop_for_display)
-        for idx, ((tid, crop, frame_idx), (bboxes, kpss)) in enumerate(zip(all_crops_data, detection_results)):
-            if bboxes.shape[0] == 0:
-                if tid not in self.id_name_map:
-                    self.id_name_map[tid] = []
-                self.id_name_map[tid].append({"status": "No face"})
-                continue
-            for i in range(bboxes.shape[0]):
-                bbox = bboxes[i, :4]
-                det_score = float(bboxes[i, 4])
-                if det_score < 0.5:
-                    continue
-                kps = kpss[i] if kpss is not None else None
-                face_obj = Face(bbox=bbox, kps=kps, det_score=det_score)
-                all_face_data.append((tid, crop, face_obj, crop))
-
-        if not all_face_data:
-            # finalized = self._finalize_results()
-            return {
-                "status": "success",
-                "execution_time": round(time.perf_counter() - start_time, 2),
-                "raw_id_name_map": {},
-                "finalized_id_name_map": {},
-                "all_face_crops_to_upload": {},
-                "timing": timing_detailed,
-                
-            }
-
-        # STEP 6: PARALLEL EMBEDDING EXTRACTION
-        t0_embedding = time.perf_counter()
-        embedding_tasks = [self.face_embedder.get_async(crop, face_obj) for tid, crop, face_obj, _ in all_face_data]
-        embeddings = await asyncio.gather(*embedding_tasks)
-        timing_detailed["buffalo_embedding"] = time.perf_counter() - t0_embedding
-
-        # STEP 7: BATCH FAISS SEARCH
-        t0_faiss = time.perf_counter()
-        all_embeddings = []
-        for emb in embeddings:
-            emb_normalized = emb.astype("float32").reshape(1, -1)
-            faiss.normalize_L2(emb_normalized)
-            all_embeddings.append(emb_normalized)
-        embeddings_batch = np.vstack(all_embeddings)
-        def _batch_faiss_search():
-            return self.index.search(embeddings_batch, 1)
-        scores_batch, indices_batch = await asyncio.to_thread(_batch_faiss_search)
-        timing_detailed["faiss_search"] = time.perf_counter() - t0_faiss
-
-        # STEP 8: PROCESS RESULTS, UPDATE BEST FACE PER TID
+        # STEP 5: PROCESS RESULTS, UPDATE BEST FACE PER TID
         track_best_scores = defaultdict(lambda: {"score": -1.0, "name": "Unknown", "crop_b64": None})
 
-        for idx, (tid, crop, face_obj, display_crop) in enumerate(all_face_data):
-            score = float(scores_batch[idx][0])
-            face_idx = int(indices_batch[idx][0])
-            name = self.names[face_idx] if score >= self.sim_threshold else "Unknown"
-
+        # We also accumulate embeddings for clustering (current + historical)
+        for tid, result_obj, crop_b64, embedding_vec, det_conf in detection_results:
+            # update id_name_map
             if tid not in self.id_name_map:
                 self.id_name_map[tid] = []
-            self.id_name_map[tid].append({"status": name})
+            self.id_name_map[tid].append(result_obj)
 
-            # update best_by_score
-            if score > track_best_scores[tid]["score"]:
-                track_best_scores[tid]["score"] = score
-                track_best_scores[tid]["name"] = name
-                if display_crop.size > 0:
-                    try:
-                        _, buffer = cv2.imencode(".jpg", display_crop)
-                        track_best_scores[tid]["crop_b64"] = base64.b64encode(buffer).decode("utf-8")
-                    except Exception:
-                        pass
+            # update track_best_scores for quick crop upload
+            status_name = result_obj.get("status", "Unknown")
+            # we had crop_b64 if present
+            if embedding_vec is not None:
+                score_for_compare = float( self.sim_threshold if status_name == "Unknown" else 1.0 )  # fallback
+                # We stored FAISS score in best selection earlier; but here embedding_vec present -> use det_conf as conf
+                if det_conf > track_best_scores[tid]["score"]:
+                    track_best_scores[tid]["score"] = det_conf
+                    track_best_scores[tid]["name"] = status_name
+                    if crop_b64:
+                        track_best_scores[tid]["crop_b64"] = crop_b64
 
-            # update best_face_per_id using embedding
-            embedding_vec = embeddings[idx].astype("float32").reshape(-1)
-            # pass embedding as 1D array
-            self._update_best_face(tid, display_crop, name, float(score), embedding=embedding_vec)
+            # update best_face_per_id using embedding (if available)
+            if embedding_vec is not None:
+                self._update_best_face(tid, cv2.imdecode(np.frombuffer(base64.b64decode(crop_b64), np.uint8), cv2.IMREAD_COLOR) if crop_b64 else np.zeros((1,1,3), np.uint8),
+                                       status_name, float(det_conf), embedding=np.array(embedding_vec, dtype="float32"))
 
-        # # Store best crops (base64) for quick upload
-        # for tid, data in track_best_scores.items():
-        #     if data["crop_b64"]:
-        #         self.track_best_crop[tid] = data["crop_b64"]
+            # also keep track_best_crop for quick upload UI
+            if crop_b64:
+                self.track_best_crop[tid] = crop_b64
 
-        # STEP: Save best faces, clustering (follows code2 logic)
+        # STEP: Save best faces, clustering (follows code1 logic)
         t0_save = time.perf_counter()
         save_best_faces,finalized_id_map = self._save_all_best_faces()
         self.timing["save_face"] += time.perf_counter() - t0_save
 
         total_exec_time = time.perf_counter() - start_time
         # finalized = self._finalize_results()
-
-        # all_face_crops_to_upload = {
-        #     str(tid): self.track_best_crop[tid]
-        #     for tid, result_obj in finalized.items()
-        #     if result_obj["status"] != "No face" and tid in self.track_best_crop
-        # }
 
         # Performance prints
         total_buffalo_time = (timing_detailed["buffalo_detection"] +
@@ -1056,7 +1035,7 @@ class FaceReIDPipeline:
         print(f"⏱️  Total Execution:       {total_exec_time:.4f}s")
         print(f"🚀 Parallel Speedup:      {(sum(timing_detailed.values()) / total_exec_time):.2f}x")
         print("="*60)
-        print(f"✅ Processed {len(all_crops_data)} crops → Found {len(all_face_data)} faces")
+        print(f"✅ Processed {len(all_crops_data)} crops → Found {len([r for r in detection_results if r[1]['status'] not in ['No face','Error']])} faces")
         print(f"✅ Identified {len([f for f in finalized_id_map.values() if f['status'] not in ['Unknown', 'No face']])} known persons")
         print("="*60 + "\n")
 
@@ -1078,7 +1057,7 @@ class FaceReIDPipeline:
             "timing": timing_detailed,
              "stats": {
                 "total_crops": len(all_crops_data),
-                "total_faces": len(all_face_data),
+                "total_faces": len([r for r in detection_results if r[1]['status'] not in ['No face','Error']]),
                 "identified_persons": len([f for f in finalized_id_map.values() if f['status'] not in ['Unknown', 'No face']])
             }
         }

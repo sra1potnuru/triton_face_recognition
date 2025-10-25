@@ -20,7 +20,7 @@ from ultralytics.engine.results import Boxes
 from ultralytics.trackers.bot_sort import BOTSORT
 from numpy.linalg import norm as l2norm
 from .tracker import FaceTracker
-
+import uuid
 # ------------------- Person Detector -------------------
 class YoloPersonDetector:
     def __init__(self, triton_url="provider.rtx4090.wyo.eg.akash.pub:30247", model_name="yolo_person_detection"):
@@ -610,7 +610,7 @@ class FaceReIDPipeline:
             if self.best_face_per_id[tid][1] == "Unknown":
                 self.best_face_per_id[tid] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
 
-    def _insert_batch_to_pg(self, img_names, crops, embeddings):
+    def _insert_batch_to_pg(self, img_names, crops, embeddings, camera_id):
         try:
             PG_HOST = "145.190.8.4"
             PG_PORT = "5432"
@@ -634,10 +634,11 @@ class FaceReIDPipeline:
 
             embeddings_list = [emb.tolist() for emb in embeddings]
             insert_query = """
-                INSERT INTO warehouse.face_clustering_batch (img_names, crops, embeddings)
-                VALUES (%s, %s, %s)
+                INSERT INTO warehouse.face_clustering_batch_replica (img_names, crops, embeddings, camera_id)
+                VALUES (%s, %s, %s, %s)
             """
-            cur.execute(insert_query, (img_names, crops_bytes, embeddings_list))
+            cur.execute(insert_query, (img_names, crops_bytes, embeddings_list, camera_id))
+
             conn.commit()
             cur.close()
             conn.close()
@@ -645,7 +646,7 @@ class FaceReIDPipeline:
         except Exception as e:
             print(f"[Error inserting batch to PostgreSQL] {e}")
 
-    def _fetch_face_clustering_batches(self):
+    def _fetch_face_clustering_batches(self, camera_id):
         try:
             PG_HOST = "145.190.8.4"
             PG_PORT = "5432"
@@ -664,10 +665,12 @@ class FaceReIDPipeline:
 
             query = """
                 SELECT batch_id, img_names, crops, embeddings, created_at
-                FROM warehouse.face_clustering_batch
+                FROM warehouse.face_clustering_batch_replica
+                WHERE camera_id = %s
                 ORDER BY created_at DESC;
             """
-            cur.execute(query)
+            cur.execute(query, (camera_id,))
+
             rows = cur.fetchall()
 
             results = []
@@ -693,7 +696,7 @@ class FaceReIDPipeline:
             print(f"[Error fetching batches from PostgreSQL] {e}")
             return []
 
-    def _save_all_best_faces(self):
+    def _save_all_best_faces(self, camera_id):
         """
         Use the best_face_per_id collected for this video, append historical batches from Postgres,
         run Agglomerative clustering, pick representative faces per cluster, and insert current video batch into PG.
@@ -741,7 +744,7 @@ class FaceReIDPipeline:
             all_crops.append(crop.copy())
 
         # Fetch historical embeddings from Postgres
-        pg_batches = self._fetch_face_clustering_batches()
+        pg_batches = self._fetch_face_clustering_batches(camera_id)
         for batch in pg_batches:
             all_embeddings.extend(batch["embeddings"])
             all_img_names.extend(batch["img_names"])
@@ -751,7 +754,8 @@ class FaceReIDPipeline:
         try:
             current_count = len(authorized_best) + len(unauthorized_best)
             if current_count > 0:
-                self._insert_batch_to_pg(all_img_names[:current_count], all_crops[:current_count], all_embeddings[:current_count])
+                self._insert_batch_to_pg(all_img_names[:current_count], all_crops[:current_count], all_embeddings[:current_count], camera_id)
+
                 print("💾 Inserted current video batch into PostgreSQL")
         except Exception as e:
             print(f"[Error while inserting current batch] {e}")
@@ -903,7 +907,7 @@ class FaceReIDPipeline:
             return tid, {"status": "Error"}, None, None, 0.0
 
     # --------------------- Main async pipeline (merged) ---------------------
-    async def process_frames(self, frames: list[np.ndarray]):
+    async def process_frames(self, frames: list[np.ndarray], camera_id: str):
         """Main async frame processing with TRUE parallel Triton calls and clustering integration."""
         start_time = time.perf_counter()
         self.track_best_crop.clear()
@@ -945,7 +949,7 @@ class FaceReIDPipeline:
                 "execution_time": round(total_exec_time, 2),
                 "raw_id_name_map": {},
                 "finalized_id_name_map": {},
-                "all_face_crops_to_upload": save_best_face,
+                "all_face_crops_to_upload": {},
                 "timing": timing_detailed
             }
 
@@ -1011,7 +1015,7 @@ class FaceReIDPipeline:
 
         # STEP: Save best faces, clustering (follows code1 logic)
         t0_save = time.perf_counter()
-        save_best_faces,finalized_id_map = self._save_all_best_faces()
+        save_best_faces, finalized_id_map = self._save_all_best_faces(camera_id)
         self.timing["save_face"] += time.perf_counter() - t0_save
 
         total_exec_time = time.perf_counter() - start_time
@@ -1078,6 +1082,7 @@ class FaceReIDPipeline:
     #     return finalized
 
 # ---------------- Async wrapper ----------------
-async def run_face_recognition(frames: list[np.ndarray]):
+async def run_face_recognition(frames: list[np.ndarray], camera_id: str):
     pipeline = FaceReIDPipeline()
-    return await pipeline.process_frames(frames)
+    return await pipeline.process_frames(frames, camera_id)
+

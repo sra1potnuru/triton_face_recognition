@@ -1,8 +1,8 @@
 import asyncio
 import logging
 from triton_frame_extractor import extract_frames_from_path
-from triton_face_recognition import run_face_recognition
-
+# from triton_face_recognition import run_face_recognition
+from end_to_end_pipeline import run_face_recognition
 logger = logging.getLogger(__name__)
 
 async def run_services(video_path, service_ids, camera_id, facing_direction=1):
@@ -26,7 +26,7 @@ async def run_services(video_path, service_ids, camera_id, facing_direction=1):
     # Face Recognition
     if 1 in service_ids:
         print("🔹 Running Face Recognition...")
-        results["face_recognition"] = await run_face_recognition(frames)
+        results["face_recognition"] = await run_face_recognition(frames,camera_id)
 
     # Number Plate Detection (example service)
     if 2 in service_ids:

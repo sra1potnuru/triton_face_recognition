@@ -696,137 +696,392 @@ class FaceReIDPipeline:
             print(f"[Error fetching batches from PostgreSQL] {e}")
             return []
 
-    def _save_all_best_faces(self, camera_id):
-        """
-        Use the best_face_per_id collected for this video, append historical batches from Postgres,
-        run Agglomerative clustering, pick representative faces per cluster, and insert current video batch into PG.
-        Returns: representative_faces (dict idx->b64), finalized_id_map (dict idx->name)
-        """
-        authorized_best = {}
-        unauthorized_best = {}
-        # os.makedirs("pipeline_images", exist_ok=True)
-        # os.makedirs("best_crops", exist_ok=True)
+    # def _save_all_best_faces(self, camera_id):
+    #     """
+    #     Use the best_face_per_id collected for this video, append historical batches from Postgres,
+    #     run Agglomerative clustering, pick representative faces per cluster, and insert current video batch into PG.
+    #     Returns: representative_faces (dict idx->b64), finalized_id_map (dict idx->name)
+    #     """
+    #     authorized_best = {}
+    #     unauthorized_best = {}
+    #     # os.makedirs("pipeline_images", exist_ok=True)
+    #     # os.makedirs("best_crops", exist_ok=True)
 
-        # Collect best faces from current video
-        for tid, (crop, name, conf, embedding) in self.best_face_per_id.items():
-            if name not in ["Unknown", "No face"]:
-                if name not in authorized_best or conf > authorized_best[name][2]:
-                    authorized_best[name] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
-            elif name == "Unknown":
-                if tid not in unauthorized_best or conf > unauthorized_best[tid][2]:
-                    unauthorized_best[tid] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
+    #     # Collect best faces from current video
+    #     for tid, (crop, name, conf, embedding) in self.best_face_per_id.items():
+    #         if name not in ["Unknown", "No face"]:
+    #             if name not in authorized_best or conf > authorized_best[name][2]:
+    #                 authorized_best[name] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
+    #         elif name == "Unknown":
+    #             if tid not in unauthorized_best or conf > unauthorized_best[tid][2]:
+    #                 unauthorized_best[tid] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
 
-        # Prepare lists
-        all_embeddings = []
-        all_img_names = []
-        all_crops = []
+    #     # Prepare lists
+    #     all_embeddings = []
+    #     all_img_names = []
+    #     all_crops = []
 
-        # Add authorized
-        for name, (crop, _, conf, embedding) in authorized_best.items():
-            if embedding is None:
-                continue
-            all_embeddings.append(embedding)
-            filename = f"{name}_{uuid.uuid4().hex[:8]}.jpg"
-            # filepath = os.path.join("best_crops", filename)
-            # cv2.imwrite(filepath, crop)
-            all_img_names.append(filename)
-            all_crops.append(crop.copy())
+    #     # Add authorized
+    #     for name, (crop, _, conf, embedding) in authorized_best.items():
+    #         if embedding is None:
+    #             continue
+    #         all_embeddings.append(embedding)
+    #         filename = f"{name}_{uuid.uuid4().hex[:8]}.jpg"
+    #         # filepath = os.path.join("best_crops", filename)
+    #         # cv2.imwrite(filepath, crop)
+    #         all_img_names.append(filename)
+    #         all_crops.append(crop.copy())
 
-        # Add unauthorized
-        for tid, (crop, name, conf, embedding) in unauthorized_best.items():
-            if embedding is None:
-                continue
-            all_embeddings.append(embedding)
-            filename = f"{name}_ID{tid}_{uuid.uuid4().hex[:8]}.jpg"
-            # filepath = os.path.join("best_crops", filename)
-            # cv2.imwrite(filepath, crop)
-            all_img_names.append(filename)
-            all_crops.append(crop.copy())
+    #     # Add unauthorized
+    #     for tid, (crop, name, conf, embedding) in unauthorized_best.items():
+    #         if embedding is None:
+    #             continue
+    #         all_embeddings.append(embedding)
+    #         filename = f"{name}_ID{tid}_{uuid.uuid4().hex[:8]}.jpg"
+    #         # filepath = os.path.join("best_crops", filename)
+    #         # cv2.imwrite(filepath, crop)
+    #         all_img_names.append(filename)
+    #         all_crops.append(crop.copy())
 
-        # Fetch historical embeddings from Postgres
-        pg_batches = self._fetch_face_clustering_batches(camera_id)
-        for batch in pg_batches:
-            all_embeddings.extend(batch["embeddings"])
-            all_img_names.extend(batch["img_names"])
-            all_crops.extend(batch["crops"])
+    #     # Fetch historical embeddings from Postgres
+    #     pg_batches = self._fetch_face_clustering_batches(camera_id)
+    #     for batch in pg_batches:
+    #         all_embeddings.extend(batch["embeddings"])
+    #         all_img_names.extend(batch["img_names"])
+    #         all_crops.extend(batch["crops"])
 
-        # Insert only current video batch into Postgres (first chunk lengths)
-        try:
-            current_count = len(authorized_best) + len(unauthorized_best)
-            if current_count > 0:
-                self._insert_batch_to_pg(all_img_names[:current_count], all_crops[:current_count], all_embeddings[:current_count], camera_id)
+    #     # Insert only current video batch into Postgres (first chunk lengths)
+    #     try:
+    #         current_count = len(authorized_best) + len(unauthorized_best)
+    #         if current_count > 0:
+    #             self._insert_batch_to_pg(all_img_names[:current_count], all_crops[:current_count], all_embeddings[:current_count], camera_id)
 
-                print("💾 Inserted current video batch into PostgreSQL")
-        except Exception as e:
-            print(f"[Error while inserting current batch] {e}")
+    #             print("💾 Inserted current video batch into PostgreSQL")
+    #     except Exception as e:
+    #         print(f"[Error while inserting current batch] {e}")
 
-        if len(all_embeddings) == 0:
-            print("⚠️ No embeddings available for clustering")
-            return {}, {}
+    #     if len(all_embeddings) == 0:
+    #         print("⚠️ No embeddings available for clustering")
+    #         return {}, {}
 
-        all_embeddings = np.array(all_embeddings, dtype="float32")
+    #     all_embeddings = np.array(all_embeddings, dtype="float32")
 
-        # Clustering: choose distance_threshold using silhouette_score heuristic
-        if len(all_embeddings) > 1:
-            best_t, best_score = 0.5, -1
-            for t in np.arange(0.1, 1.0, 0.05):
-                model = AgglomerativeClustering(n_clusters=None, distance_threshold=t, metric="cosine", linkage="average")
-                try:
-                    labels = model.fit_predict(all_embeddings)
-                except Exception:
+    #     # Clustering: choose distance_threshold using silhouette_score heuristic
+    #     if len(all_embeddings) > 1:
+    #         best_t, best_score = 0.5, -1
+    #         for t in np.arange(0.1, 1.0, 0.05):
+    #             model = AgglomerativeClustering(n_clusters=None, distance_threshold=t, metric="cosine", linkage="average")
+    #             try:
+    #                 labels = model.fit_predict(all_embeddings)
+    #             except Exception:
+    #                 continue
+    #             n_labels = len(set(labels))
+    #             if n_labels < 2 or n_labels >= len(all_embeddings):
+    #                 continue
+    #             try:
+    #                 score = silhouette_score(all_embeddings, labels)
+    #             except Exception:
+    #                 continue
+    #             if score > best_score:
+    #                 best_score, best_t = score, t
+    #         print(f"➡ Agglomerative: Chosen distance_threshold = {best_t:.3f}")
+    #         model = AgglomerativeClustering(n_clusters=None, distance_threshold=best_t, metric="cosine", linkage="average")
+    #         labels = model.fit_predict(all_embeddings)
+    #     else:
+    #         labels = np.zeros(len(all_embeddings), dtype=int)
+
+    #     # Build clusters and choose representatives
+    #     cluster_map = defaultdict(list)
+    #     for lbl, img_name, crop, emb in zip(labels, all_img_names, all_crops, all_embeddings):
+    #         cluster_map[lbl].append((img_name, crop, emb))
+
+    #     print("\n🔹 Agglomerative Clusters:")
+    #     for lbl, members in cluster_map.items():
+    #         item_names = [name for name, _, _ in members]
+    #         print(f"  Cluster {lbl}: {item_names}")
+
+    #     representative_faces = {}
+    #     finalized_id_map = {}
+    #     counter = 0
+
+    #     for lbl, members in cluster_map.items():
+    #         chosen_img = None
+    #         # prefer named (authorized) images first
+    #         for img_name, crop, emb in members:
+    #             if "Unknown" not in img_name:
+    #                 chosen_img = (img_name, crop, emb)
+    #                 break
+    #         if chosen_img is None:
+    #             chosen_img = members[np.random.randint(len(members))]
+    #         img_name, crop, emb = chosen_img
+    #         _, buffer = cv2.imencode(".jpg", crop)
+    #         b64_crop = base64.b64encode(buffer).decode("utf-8")
+    #         # file_path=os.path.join("pipeline_images", img_name)
+    #         # cv2.imwrite(file_path, crop)
+    #         name = os.path.splitext(os.path.basename(img_name))[0]
+    #         representative_faces[counter] = b64_crop
+    #         # finalized_id_map[counter] = name
+    #         finalized_id_map[counter] = {"status": name}
+    #         counter += 1
+
+    #     print(f"💾 Saved {len(representative_faces)} representative faces.")
+    #     return representative_faces, finalized_id_map
+
+    def _save_all_best_faces(self):
+            os.makedirs("pipeline_images", exist_ok=True)
+            os.makedirs("best_crops", exist_ok=True)
+            """
+            Use the best_face_per_id collected for this video, append historical batches from Postgres,
+            run Agglomerative clustering, pick representative faces per cluster, and insert current video batch into PG.
+            Returns: representative_faces (dict idx->b64), finalized_id_map (dict idx->name)
+            """
+            authorized_best = {}
+            unauthorized_best = {}
+        
+            # Collect best faces from current video
+            for tid, (crop, name, conf, embedding) in self.best_face_per_id.items():
+                if name not in ["Unknown", "No face"]:
+                    if name not in authorized_best or conf > authorized_best[name][2]:
+                        authorized_best[name] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
+                elif name == "Unknown":
+                    if tid not in unauthorized_best or conf > unauthorized_best[tid][2]:
+                        unauthorized_best[tid] = (crop.copy(), name, conf, embedding.copy() if embedding is not None else None)
+        
+            # Prepare lists
+            all_embeddings = []
+            all_img_names = []
+            all_crops = []
+        
+            # Add authorized
+            for name, (crop, _, conf, embedding) in authorized_best.items():
+                if embedding is None:
                     continue
-                n_labels = len(set(labels))
-                if n_labels < 2 or n_labels >= len(all_embeddings):
+                all_embeddings.append(embedding)
+                filename = f"{name}_{uuid.uuid4().hex[:8]}.jpg"
+                # filepath = os.path.join("best_crops", filename)
+                # cv2.imwrite(filepath, crop)
+                all_img_names.append(filename)
+                all_crops.append(crop.copy())
+        
+            # Add unauthorized
+            for tid, (crop, name, conf, embedding) in unauthorized_best.items():
+                if embedding is None:
                     continue
-                try:
-                    score = silhouette_score(all_embeddings, labels)
-                except Exception:
-                    continue
-                if score > best_score:
-                    best_score, best_t = score, t
-            print(f"➡ Agglomerative: Chosen distance_threshold = {best_t:.3f}")
-            model = AgglomerativeClustering(n_clusters=None, distance_threshold=best_t, metric="cosine", linkage="average")
-            labels = model.fit_predict(all_embeddings)
-        else:
-            labels = np.zeros(len(all_embeddings), dtype=int)
+                all_embeddings.append(embedding)
+                filename = f"{name}ID{tid}{uuid.uuid4().hex[:8]}.jpg"
+                # filepath = os.path.join("best_crops", filename)
+                # cv2.imwrite(filepath, crop)
+                all_img_names.append(filename)
+                all_crops.append(crop.copy())
+        
+            # --- NEW ---
+            # Store how many embeddings belong to the current (new) video before adding historical ones
+            current_count = len(all_embeddings)
+        
+            # Fetch historical embeddings from Postgres
+            
+            historical_img_names = []
+            
+            pg_batches = self._fetch_face_clustering_batches()
+            for batch in pg_batches:
+                all_embeddings.extend(batch["embeddings"])
+                all_img_names.extend(batch["img_names"])
+                all_crops.extend(batch["crops"])
+                
+                historical_img_names.extend(batch["img_names"])
+                
+        
+            historical_count = len(all_embeddings) - current_count  # --- NEW ---
+        
+            # Insert only current video batch into Postgres (first chunk lengths)
+            try:
+                if current_count > 0:
+                    self._insert_batch_to_pg(
+                        all_img_names[:current_count],
+                        all_crops[:current_count],
+                        all_embeddings[:current_count]
+                    )
+                    print("💾 Inserted current video batch into PostgreSQL")
+            except Exception as e:
+                print(f"[Error while inserting current batch] {e}")
+        
+            if len(all_embeddings) == 0:
+                print("⚠ No embeddings available for clustering")
+                return {}, {}
+        
+            all_embeddings = np.array(all_embeddings, dtype="float32")
+        
+            # Clustering: choose distance_threshold using silhouette_score heuristic
+            if len(all_embeddings) > 1:
+                best_t, best_score = 0.5, -1
+                for t in np.arange(0.1, 1.0, 0.05):
+                    model = AgglomerativeClustering(
+                        n_clusters=None, distance_threshold=t, metric="cosine", linkage="average"
+                    )
+                    try:
+                        labels = model.fit_predict(all_embeddings)
+                    except Exception:
+                        continue
+                    n_labels = len(set(labels))
+                    if n_labels < 2 or n_labels >= len(all_embeddings):
+                        continue
+                    try:
+                        score = silhouette_score(all_embeddings, labels)
+                    except Exception:
+                        continue
+                    if score > best_score:
+                        best_score, best_t = score, t
+                print(f"➡ Agglomerative: Chosen distance_threshold = {best_t:.3f}")
+                model = AgglomerativeClustering(
+                    n_clusters=None, distance_threshold=best_t, metric="cosine", linkage="average"
+                )
+                labels = model.fit_predict(all_embeddings)
+            else:
+                labels = np.zeros(len(all_embeddings), dtype=int)
+        
+            # Build clusters
+            cluster_map = defaultdict(list)
+            for lbl, img_name, crop, emb in zip(labels, all_img_names, all_crops, all_embeddings):
+                cluster_map[lbl].append((img_name, crop, emb))
+            # Collect all authorized names from historical embeddings (before current_count)
+            # print("historiucal names:",historical_img_names)
+            historical_authorized_names = set()
+            for i, name in enumerate(historical_img_names):
+                    base = os.path.splitext(os.path.basename(name))[0].split('_')[0]
+                    # print("base",base)
+                    if base not in ["Unknown", "No", "face"]:
+                        historical_authorized_names.add(base)
+            # print("historical names: ",historical_authorized_names)
+            print("\n🔹 Agglomerative Clusters:")
+            for lbl, members in cluster_map.items():
+                item_names = [name for name, _, _ in members]
+                print(f"  Cluster {lbl}: {item_names}")
 
-        # Build clusters and choose representatives
-        cluster_map = defaultdict(list)
-        for lbl, img_name, crop, emb in zip(labels, all_img_names, all_crops, all_embeddings):
-            cluster_map[lbl].append((img_name, crop, emb))
+            # import matplotlib.pyplot as plt
+            
+            # # --- Visualization ---
+            # num_clusters = len(cluster_map)
+            # fig, axes = plt.subplots(num_clusters, 1, figsize=(15, 3 * num_clusters))
+            
+            # if num_clusters == 1:
+            #     axes = [axes]  # Make iterable if only one cluster
+            
+            # for ax, (lbl, members) in zip(axes, cluster_map.items()):
+            #     # Get crops for each cluster
+            #     imgs = [cv2.cvtColor(crop, cv2.COLOR_BGR2RGB) for _, crop, _ in members]
+            #     item_names = [os.path.basename(name) for name, _, _ in members]
+            
+            #     # Concatenate all images in a row
+            #     try:
+            #         combined = cv2.hconcat(imgs)
+            #     except Exception:
+            #         # Resize all to same height if mismatch
+            #         heights = [img.shape[0] for img in imgs]
+            #         min_h = min(heights)
+            #         resized = [cv2.resize(img, (int(img.shape[1] * min_h / img.shape[0]), min_h)) for img in imgs]
+            #         combined = cv2.hconcat(resized)
+            
+            #     ax.imshow(combined)
+            #     ax.set_title(f"Cluster {lbl}: {', '.join(item_names)}", fontsize=10)
+            #     ax.axis("off")
+            
+            # plt.tight_layout()
+            # plt.show()
 
-        print("\n🔹 Agglomerative Clusters:")
-        for lbl, members in cluster_map.items():
-            item_names = [name for name, _, _ in members]
-            print(f"  Cluster {lbl}: {item_names}")
+        
+            # --- NEW ---
+            # Identify "truly new" clusters (contain only new embeddings, no historical)
+            # --- Identify new clusters ---
+            # Collect all authorized names from historical embeddings (before current_count)
+    
 
-        representative_faces = {}
-        finalized_id_map = {}
-        counter = 0
+            pure_new_clusters = {}
+            
+            for lbl, members in cluster_map.items():
+                indices = [all_img_names.index(name) for name, _, _ in members]
+                has_historical = any(idx >= current_count for idx in indices)
+                has_new = any(idx < current_count for idx in indices)
+            
+                # # Check for new authorized face
+                # new_authorized_found = any(
+                #     not os.path.splitext(os.path.basename(n))[0].startswith(("Unknown", "No", "face"))
+                #     and all_img_names.index(n) < current_count
+                #     for n, _, _ in members
+                # )
+                # Check for unseen authorized face
+                new_authorized_found = any(
+                    not os.path.splitext(os.path.basename(n))[0].startswith(("Unknown", "No", "face"))
+                    and all_img_names.index(n) < current_count
+                    and os.path.splitext(os.path.basename(n))[0].split('_')[0] not in historical_authorized_names
+                    for n, _, _ in members
+                )
 
-        for lbl, members in cluster_map.items():
-            chosen_img = None
-            # prefer named (authorized) images first
-            for img_name, crop, emb in members:
-                if "Unknown" not in img_name:
-                    chosen_img = (img_name, crop, emb)
-                    break
-            if chosen_img is None:
-                chosen_img = members[np.random.randint(len(members))]
-            img_name, crop, emb = chosen_img
-            _, buffer = cv2.imencode(".jpg", crop)
-            b64_crop = base64.b64encode(buffer).decode("utf-8")
-            # file_path=os.path.join("pipeline_images", img_name)
-            # cv2.imwrite(file_path, crop)
-            name = os.path.splitext(os.path.basename(img_name))[0]
-            representative_faces[counter] = b64_crop
-            # finalized_id_map[counter] = name
-            finalized_id_map[counter] = {"status": name}
-            counter += 1
+            
+                # Apply the rule
+                if (has_new and not has_historical) or new_authorized_found:
+                    pure_new_clusters[lbl] = members
+            
+            # ---- Logging ----
+            print(f"\n✨ Found {len(pure_new_clusters)} new or newly-updated clusters!")
+            if pure_new_clusters:
+                print("🆕 New / Updated Clusters:")
+                for lbl, members in pure_new_clusters.items():
+                    item_names = [name for name, _, _ in members]
+            
+                    # Determine reason
+                    has_new_authorized = any(
+                        not os.path.splitext(os.path.basename(n))[0].startswith(("Unknown", "No", "face"))
+                        and all_img_names.index(n) < current_count
+                        for n, _, _ in members
+                    )
+                    has_historical = any(all_img_names.index(n) >= current_count for n, _, _ in members)
+            
+                    if has_new_authorized:
+                        reason = "new authorized added"
+                    elif not has_historical:
+                        reason = "completely new cluster"
+                    else:
+                        reason = "—"
+            
+                    print(f"  🔸 Cluster {lbl}: {item_names}  ({reason})")
+            else:
+                print("No new or updated clusters found.")
 
-        print(f"💾 Saved {len(representative_faces)} representative faces.")
-        return representative_faces, finalized_id_map
-
+            # --- Replace cluster_map with only new clusters for saving ---
+            cluster_map = pure_new_clusters
+        
+            # Choose representative faces
+            representative_faces = {}
+            finalized_id_map = {}
+            counter = 0
+        
+            for lbl, members in cluster_map.items():
+                chosen_img = None
+                for img_name, crop, emb in members:
+                    if "Unknown" not in img_name:
+                        chosen_img = (img_name, crop, emb)
+                        break
+                if chosen_img is None:
+                    chosen_img = members[np.random.randint(len(members))]
+        
+                img_name, crop, emb = chosen_img
+                _, buffer = cv2.imencode(".jpg", crop)
+                b64_crop = base64.b64encode(buffer).decode("utf-8")
+                # file_path=os.path.join("pipeline_images", img_name)
+                # cv2.imwrite(file_path, crop)
+                name_from_file = os.path.splitext(os.path.basename(img_name))[0]
+                base_name = name_from_file.split('_')[0]
+                final_status = "Unknown"
+        
+                if base_name != "Unknown":
+                    final_status = self.name_to_id_map.get(base_name, base_name)
+        
+                representative_faces[counter] = b64_crop
+                finalized_id_map[counter] = {"status": final_status}
+                counter += 1
+        
+            print(f"💾 Saved {len(representative_faces)} representative faces from new clusters.")
+            return representative_faces, finalized_id_map
     # -------------- Async helpers borrowed from code2 (but extended) --------------
     async def _process_single_face(self, crop, face_obj):
         """Process a single face: embedding + FAISS search.

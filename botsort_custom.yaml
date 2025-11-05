@@ -1,0 +1,27 @@
+# BoT-SORT Tracker Configuration
+# Save this file as 'botsort_custom.yaml'
+
+tracker_type: botsort
+
+# Detection thresholds
+track_high_thresh: 0.5    # High confidence threshold for track initialization
+track_low_thresh: 0.3     # Low confidence threshold for track continuation
+new_track_thresh: 0.5     # Threshold for creating new tracks
+
+# Tracking parameters
+track_buffer: 30          # Number of frames to keep lost tracks
+match_thresh: 0.9         # IoU threshold for matching detections to tracks
+fuse_score: true          # Whether to fuse detection scores
+
+# Motion compensation
+gmc_method: null          # Global Motion Compensation method (null, orb, ecc, sparseOptFlow)
+
+# Matching thresholds
+proximity_thresh: 0.5     # Threshold for proximity-based matching
+appearance_thresh: 0.8    # Threshold for appearance-based matching
+
+# Re-identification
+with_reid: false          # Enable/disable ReID feature extraction
+
+# Model configuration
+model: auto               # ReID model path or 'auto' for default
